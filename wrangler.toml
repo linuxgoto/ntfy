@@ -1,0 +1,40 @@
+name = "ntfy-edge"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+# 需要 DO（SQLite 存储）与 WebSocket
+compatibility_flags = ["nodejs_compat"]
+
+# ---------- Workers 基础配置 ----------
+[observability]
+enabled = true
+
+# ---------- 每个 topic 一个 Durable Object ----------
+[[durable_objects.bindings]]
+name = "TOPIC"
+class_name = "TopicDO"
+
+# SQLite 后端的 DO 必须走新的迁移方式（new_sqlite_classes）
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TopicDO"]
+
+# ---------- R2：附件存储 ----------
+# 先在控制台建桶，然后把 bucket_name 改成你的桶名
+[[r2_buckets]]
+binding = "ATTACHMENTS"
+bucket_name = "ntfy-attachments"
+
+# ---------- 环境变量 ----------
+[vars]
+# 公开访问地址；绑定自定义域后改这里，App 里填的服务器地址就靠它对外展示
+BASE_URL = ""
+# 消息缓存时长
+MESSAGE_CACHE_DURATION = "12h"
+# 附件保留时长
+ATTACHMENT_EXPIRY = "3h"
+# 附件大小上限（字节），R2 免费额度足够，Worker 请求体上限 100MB
+ATTACHMENT_MAX_SIZE = "15728640"
+# 单个 topic 最多保留的消息条数
+MESSAGE_LIMIT = "2048"
+# 可选：设置后发布/订阅都要带上 Bearer token（留空 = topic 即密码）
+AUTH_TOKEN = ""
