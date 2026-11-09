@@ -1,0 +1,138 @@
+name: Deploy ntfy to Cloudflare
+
+# 触发方式：
+#   1) 往 main 分支 push 代码 -> 自动部署
+#   2) 在 Actions 页面点「Run workflow」-> 手动部署（改完 Variables 后手动跑这个）
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一时间只跑一个部署，避免两次部署互相覆盖
+concurrency:
+  group: deploy-ntfy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  WRANGLER_SEND_METRICS: "false"
+  # ---- Cloudflare 凭据（GitHub Secrets，必须配）----
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  # ---- 运行参数（GitHub Variables，可选；不配就用 wrangler.toml 默认值）----
+  NTFY_BASE_URL: ${{ vars.NTFY_BASE_URL }}
+  MESSAGE_CACHE_DURATION: ${{ vars.MESSAGE_CACHE_DURATION }}
+  ATTACHMENT_EXPIRY: ${{ vars.ATTACHMENT_EXPIRY }}
+  ATTACHMENT_MAX_SIZE: ${{ vars.ATTACHMENT_MAX_SIZE }}
+  MESSAGE_LIMIT: ${{ vars.MESSAGE_LIMIT }}
+  # ---- 访问密码（GitHub Secret，可选）----
+  NTFY_AUTH_TOKEN: ${{ secrets.NTFY_AUTH_TOKEN }}
+
+jobs:
+  deploy:
+    name: 部署
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 检查密钥是否配齐
+        run: |
+          missing=0
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "::error::缺少 Secret CLOUDFLARE_API_TOKEN（Scoped API Token，需 Workers Scripts:Edit + Workers R2 Storage:Edit）"
+            missing=1
+          fi
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "::error::缺少 Secret CLOUDFLARE_ACCOUNT_ID（控制台右侧 Account ID）"
+            missing=1
+          fi
+          [ "$missing" -eq 0 ] || exit 1
+          # 把敏感值加进日志掩码，防止后续输出泄露
+          [ -n "$NTFY_AUTH_TOKEN" ] && echo "::add-mask::$NTFY_AUTH_TOKEN"
+          echo "密钥检查通过。"
+
+      - name: 离线自测（代码门禁，32 项）
+        run: npm test
+
+      - name: 创建 R2 桶（已存在则跳过）
+        run: |
+          set +e
+          out=$(npx wrangler r2 bucket create ntfy-attachments 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          if [ $code -eq 0 ]; then
+            echo "R2 桶 ntfy-attachments 已创建。"
+          elif echo "$out" | grep -qiE "already exists|already own|10004"; then
+            echo "R2 桶已存在，跳过。"
+          else
+            echo "::error::创建 R2 桶失败。请确认 token 含 Workers R2 Storage:Edit 权限，且账号已开通 R2。"
+            exit 1
+          fi
+
+      - name: 注入 Variables/Secrets 到 wrangler.toml
+        run: node scripts/ci-config.mjs
+
+      - name: 部署到 Cloudflare
+        id: deploy
+        run: |
+          set -o pipefail
+          npx wrangler deploy 2>&1 | tee deploy.log
+          url=$(grep -oE 'https://[A-Za-z0-9._-]+\.workers\.dev' deploy.log | tail -1)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "本次部署地址：${url:-（未解析到 workers.dev 地址，通常说明已绑自定义域名）}"
+
+      - name: 未设自定义域名时，自动回填 workers.dev 地址为 BASE_URL
+        if: ${{ vars.NTFY_BASE_URL == '' }}
+        env:
+          NTFY_BASE_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          if [ -z "$NTFY_BASE_URL" ]; then
+            echo "::error::未能从部署日志解析到 workers.dev 地址，无法回填 BASE_URL"
+            exit 1
+          fi
+          node scripts/ci-config.mjs
+          npx wrangler deploy
+
+      - name: 线上冒烟测试（10 项接口）
+        env:
+          TARGET: ${{ vars.NTFY_BASE_URL != '' && vars.NTFY_BASE_URL || steps.deploy.outputs.url }}
+        run: |
+          echo "冒烟测试目标：$TARGET"
+          node scripts/smoke-test.mjs "$TARGET"
+
+      - name: 写入部署摘要
+        if: always()
+        env:
+          TARGET: ${{ vars.NTFY_BASE_URL != '' && vars.NTFY_BASE_URL || steps.deploy.outputs.url }}
+        run: |
+          {
+            echo "## ntfy 部署结果"
+            echo ""
+            if [ "${{ job.status }}" = "success" ]; then
+              echo "状态：✅ 成功"
+            else
+              echo "状态：❌ 失败（往上翻这一步之前的日志找原因）"
+            fi
+            echo ""
+            echo "- 服务地址：\`${TARGET:-未确定}\`"
+            echo "- 健康检查：\`${TARGET:-}/v1/health\`"
+            echo "- 网页调试：\`${TARGET:-}/\`"
+            echo "- 手机 App 服务器地址填：\`${TARGET:-}\`"
+            echo ""
+            echo "> 手机端接入步骤见《小白操作手册.md》第 14 步。"
+          } >> "$GITHUB_STEP_SUMMARY"
